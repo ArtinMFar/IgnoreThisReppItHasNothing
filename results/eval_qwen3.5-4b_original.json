@@ -1,0 +1,53 @@
+{
+ "model": "teacher",
+ "scaling": [
+  {
+   "context": 1024,
+   "cache_mb": 33.0,
+   "prefill_s": 0.04638195037841797,
+   "decode_ms_per_token": 31.81079775094986,
+   "peak_gpu_gb": 9.33174272
+  },
+  {
+   "context": 4096,
+   "cache_mb": 129.0,
+   "prefill_s": 0.07413411140441895,
+   "decode_ms_per_token": 29.686681926250458,
+   "peak_gpu_gb": 9.834912256
+  },
+  {
+   "context": 16384,
+   "cache_mb": 513.0,
+   "prefill_s": 0.41566944122314453,
+   "decode_ms_per_token": 33.56403857469559,
+   "peak_gpu_gb": 10.40304896
+  },
+  {
+   "context": 65536,
+   "cache_mb": 2049.0,
+   "prefill_s": 3.277946710586548,
+   "decode_ms_per_token": 28.02538126707077,
+   "peak_gpu_gb": 13.423341056
+  },
+  {
+   "context": 131072,
+   "cache_mb": 4097.0,
+   "prefill_s": 10.738938808441162,
+   "decode_ms_per_token": 29.79365736246109,
+   "peak_gpu_gb": 17.450397184
+  }
+ ],
+ "memory_recall": {
+  "3000_tokens": 0.7333333333333333,
+  "6000_tokens": 0.8666666666666667,
+  "12000_tokens": 1.0,
+  "24000_tokens": 0.8666666666666667
+ },
+ "long_nll": {
+  "nll_0-2048": 2.620545770193836,
+  "nll_2048-8192": 2.6098592418353714,
+  "nll_8192-16384": 2.5370284380741728,
+  "nll_16384-32768": 2.5095724893489955
+ },
+ "chartqa_relaxed_acc": 0.69
+}

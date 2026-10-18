@@ -93,7 +93,7 @@ def train_8(extra: list[str]):
 
 
 @app.local_entrypoint()
-def train(gpus: int = 1, out: str = "/ckpt/run1", max_steps: int = 0, accum: int = 8, save_every: int = 200,
+def train(gpus: int = 1, out: str = "/ckpt/run1", max_steps: int = 0, accum: int = 8, save_every: int = 50,
           lr: float = 1e-5, gate_lr: float = 1e-4, theta_lr: float = 2e-6, attn: str = "rq_flex",
           warmup: int = 40, debug_mem: bool = False):
     extra = ["--debug-mem"] * debug_mem + ["--out", out, "--max-steps", str(max_steps), "--accum", str(accum), "--save-every", str(save_every),

@@ -81,14 +81,16 @@ layers (every 4th layer). RecurrentQwen-4b changes:
    heads are free to track it. Recent repetitive content is still visible through the 2k attention window.
    Measured on held-out samples, memory heads skip {100 * gate.get('skip_prob_filler', 0):.0f}% of the time on repetitive
    tokens and {100 * gate.get('skip_prob_other', 0):.0f}% of the time on other tokens.
-3. **Data-dependent state rotation (Mamba-3's complex-valued state).** [Mamba-3](https://arxiv.org/abs/2510.?????)
+3. **Data-dependent state rotation (Mamba-3's complex-valued state).** [Mamba-3](https://arxiv.org/abs/2603.15569)
    shows that a complex-valued SSM equals a real one whose B/C projections are rotated by a cumulative,
    data-dependent angle (the "RoPE trick"), which gives the state rotational dynamics and improves state tracking.
    We rotate 16 channel pairs of every key/query head by `phase_t = Σ dt_s · θ(x_s)`; the phase is carried in the
    cache during generation.
 4. Kept from Gated DeltaNet: the **delta rule** (only the part of a new value that the state does not already predict
    gets written, which is the same "store the most useful information" idea Mamba-3 emphasises), gated decay, and
-   the short convolution (which plays the role of Mamba-3's trapezoidal two-tap input mixing).
+   the short convolution. Mamba-3's exponential-trapezoidal discretization amounts to an implicit convolution on
+   the input, a role the existing short convolution already fills here. Mamba-3's MIMO variant (more FLOPs per
+   decode step) was not applied: it changes the state layout and would need pretraining.
 
 All new parameters are initialised to (almost exactly) reproduce the original model, then the whole language model
 is trained.
