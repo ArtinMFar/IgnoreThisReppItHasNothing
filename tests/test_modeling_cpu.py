@@ -110,6 +110,31 @@ def test_save_load_roundtrip(tmp="/tmp/rq_tiny"):
     assert err < 1e-5
 
 
+
+def test_multiturn_cache_reuse_matches_recompute():
+    """Keeping the cache between chat turns gives the same greedy outputs as re-reading the whole history."""
+    _, model = build(window=8)
+    torch.manual_seed(2)
+    with torch.no_grad():
+        for layer in model.model.language_model.layers:
+            if layer.block_type == "linear_attention":
+                layer.linear_attn.in_proj_skip.weight.normal_(0, 0.3)
+                layer.linear_attn.in_proj_theta.weight.normal_(0, 0.3)
+    turns = [torch.randint(0, 500, (1, n)) for n in (11, 7, 9)]
+    cache = DynamicCache(config=model.config.get_text_config())
+    ids, cached_replies, fresh_replies = None, [], []
+    for turn in turns:
+        ids = turn if ids is None else torch.cat([ids, turn], dim=1)
+        out = model.generate(input_ids=ids, past_key_values=cache, max_new_tokens=6, do_sample=False)
+        cached_replies.append(out[:, ids.shape[1]:])
+        fresh = model.generate(input_ids=ids, max_new_tokens=6, do_sample=False)
+        fresh_replies.append(fresh[:, ids.shape[1]:])
+        ids = out
+    print("cached:", [r.tolist() for r in cached_replies])
+    print("fresh: ", [r.tolist() for r in fresh_replies])
+    assert all(torch.equal(a, b) for a, b in zip(cached_replies, fresh_replies))
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

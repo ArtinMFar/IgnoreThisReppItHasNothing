@@ -46,12 +46,20 @@ def prefill(model, ids, cache, chunk=4096):
 
 
 @torch.no_grad()
-def scaling(model, lengths, device, decode_steps=32):
+def scaling(model, lengths, device, decode_steps=32, turn_tokens=512):
+    """Cold prefill of the whole context vs. a new chat turn on top of the cached conversation.
+
+    `prefill_s` re-reads all `context` tokens from scratch. `next_turn_ttft_s` is what a chat/NPC loop sees when it
+    keeps the cache between turns: time to first token for a new `turn_tokens`-token message after `context` tokens
+    of history. For RecurrentQwen that only touches the fixed-size state and the 2k window, so it stays flat.
+    """
     from transformers import DynamicCache
 
     # warm-up: kernel autotuning / compilation for every chunk shape used below
     warm = DynamicCache(config=model.config.get_text_config())
     out = prefill(model, torch.randint(1000, 100000, (1, 2 * 4096 + 1024), device=device), warm)
+    out = model(input_ids=torch.randint(1000, 100000, (1, turn_tokens), device=device), past_key_values=warm,
+                use_cache=True, logits_to_keep=1)
     for _ in range(4):
         out = model(input_ids=out.logits[:, -1:].argmax(-1), past_key_values=warm, use_cache=True)
     del warm, out
@@ -65,15 +73,20 @@ def scaling(model, lengths, device, decode_steps=32):
         out = prefill(model, ids, cache)
         torch.cuda.synchronize()
         t_prefill = time.time() - t0
+        turn = torch.randint(1000, 100000, (1, turn_tokens), device=device)
+        torch.cuda.synchronize()
+        t0 = time.time()
+        out = model(input_ids=turn, past_key_values=cache, use_cache=True, logits_to_keep=1)
         nxt = out.logits[:, -1:].argmax(-1)
         torch.cuda.synchronize()
+        t_turn = time.time() - t0
         t0 = time.time()
         for _ in range(decode_steps):
             out = model(input_ids=nxt, past_key_values=cache, use_cache=True)
             nxt = out.logits[:, -1:].argmax(-1)
         torch.cuda.synchronize()
         results.append({
-            "context": L, "cache_mb": cache_bytes(cache) / 2**20, "prefill_s": t_prefill,
+            "context": L, "cache_mb": cache_bytes(cache) / 2**20, "prefill_s": t_prefill, "next_turn_ttft_s": t_turn,
             "decode_ms_per_token": (time.time() - t0) / decode_steps * 1000,
             "peak_gpu_gb": torch.cuda.max_memory_allocated() / 1e9,
         })

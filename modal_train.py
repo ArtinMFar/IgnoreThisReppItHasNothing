@@ -151,3 +151,25 @@ def verify_hub(repo: str):
                                            return_tensors="pt", enable_thinking=False).to("cuda")
     out = model.generate(**inputs, max_new_tokens=120, do_sample=False)
     print("VISION:", processor.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True))
+
+    # Multi-turn NPC loop with the cache kept between turns (the usage pattern from the model card), with thousands of
+    # tokens of repetitive game ticks between stating facts and asking about them.
+    from transformers import DynamicCache
+
+    tok = processor.tokenizer
+    im_end = tok.convert_tokens_to_ids("<|im_end|>")
+    cache = DynamicCache(config=model.config.get_text_config())
+    ids = tok("<|im_start|>system\nYou are Garrick, the village blacksmith NPC. Game ticks arrive as user messages; "
+              "answer them with a single movement command.<|im_end|>", return_tensors="pt").input_ids.cuda()
+    msgs = ["[Player]: Hi Garrick! My name is Lyra and the password to the guild hall is 'silver heron'."]
+    msgs += [f"[tick {t}] npc_pos=({10 + t % 7}, {4 + t % 5}) state=walking" for t in range(330)]
+    msgs += ["[Player]: Do you remember my name and the guild hall password?"]
+    for i, msg in enumerate(msgs):
+        turn = f"\n<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ids = torch.cat([ids, tok(turn, return_tensors="pt").input_ids.cuda()], dim=1)
+        last = i in (0, len(msgs) - 1)
+        out = model.generate(input_ids=ids, past_key_values=cache, max_new_tokens=60 if last else 12, do_sample=False)
+        reply = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
+        if i in (0, 1, 2) or last:
+            print(f"NPC turn {i} (context {ids.shape[1]} tokens): {msg[:60]!r} -> {reply!r}", flush=True)
+        ids = out if out[0, -1] == im_end else torch.cat([out, out.new_tensor([[im_end]])], dim=1)

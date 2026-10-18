@@ -4,11 +4,14 @@ import json
 
 
 def _scaling_table(teacher, student):
-    rows = ["| Context (tokens) | Cache: Qwen3.5-4B | Cache: RecurrentQwen-4b | Decode ms/token: Qwen3.5-4B | "
-            "Decode ms/token: RecurrentQwen-4b | Prefill s: Qwen3.5-4B | Prefill s: RecurrentQwen-4b |",
-            "|---|---|---|---|---|---|---|"]
+    rows = ["| Context so far (tokens) | Cache: Qwen3.5-4B | Cache: RecurrentQwen-4b | "
+            "Next-turn TTFT (cached): Qwen3.5-4B | Next-turn TTFT (cached): RecurrentQwen-4b | "
+            "Decode ms/token: Qwen3.5-4B | Decode ms/token: RecurrentQwen-4b | "
+            "Cold prefill s: Qwen3.5-4B | Cold prefill s: RecurrentQwen-4b |",
+            "|---|---|---|---|---|---|---|---|---|"]
     for t, s in zip(teacher, student):
         rows.append(f"| {t['context']:,} | {t['cache_mb']:.0f} MB | {s['cache_mb']:.0f} MB | "
+                    f"{1000 * t['next_turn_ttft_s']:.0f} ms | {1000 * s['next_turn_ttft_s']:.0f} ms | "
                     f"{t['decode_ms_per_token']:.1f} | {s['decode_ms_per_token']:.1f} | "
                     f"{t['prefill_s']:.2f} | {s['prefill_s']:.2f} |")
     return "\n".join(rows)
@@ -118,9 +121,13 @@ is trained.
 
 {_scaling_table(teacher_eval['scaling'], student_eval['scaling'])}
 
-The cache (and per-token decode cost) of RecurrentQwen-4b is flat beyond 2k tokens. Prefill time (time to first token)
-still grows **linearly** with prompt length, since every prompt token has to be read once, but there's no quadratic
-attention term.
+- **Cache memory and per-token decode cost** are flat beyond 2k tokens.
+- **Next-turn TTFT (cached)**: in a chat or game loop, keep the cache (`past_key_values`) between turns. A new 512-token
+  message then only touches the fixed-size recurrent state and the last 2,047 tokens of keys/values, so its time to
+  first token does not grow with the length of the conversation.
+- **Cold prefill** (re-reading a whole long prompt from scratch, e.g. a new conversation that starts with a 100k-token
+  document) has to look at every token once, so it grows linearly with prompt length. There's no quadratic attention
+  term.
 
 ### Recall of facts buried under repetitive content (held-out synthetic tasks, greedy, exact match)
 
@@ -159,9 +166,33 @@ out = model.generate(**inputs, max_new_tokens=256)
 print(processor.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True))
 ```
 
-For very long prompts, prefill in chunks (e.g. 4,096 tokens per forward call with a shared `DynamicCache`) to keep
-peak memory flat as well. The default `DynamicCache` built from this config already keeps only the last 2,047
-keys/values in the attention layers.
+**Keep the cache between turns** (chat apps, game NPCs): pass the previous `past_key_values` back in with only the new
+message, so each turn costs the same no matter how long the conversation is. The default `DynamicCache` built from this
+config keeps only the last 2,047 keys/values in the attention layers plus the fixed-size recurrent states (~64 MB total
+in bf16, batch 1):
+
+```python
+import torch
+from transformers import DynamicCache
+
+tok = processor.tokenizer
+im_end = tok.convert_tokens_to_ids("<|im_end|>")
+cache = DynamicCache(config=model.config.get_text_config())
+ids = tok("<|im_start|>system\nYou are Garrick, the village blacksmith.<|im_end|>", return_tensors="pt").input_ids
+ids = ids.to(model.device)
+
+for user_msg in ["Hi! My name is Lyra.", "[tick 1] player_pos=(3, 4)", "What's my name?"]:
+    turn = f"\n<|im_start|>user\n{{user_msg}}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    ids = torch.cat([ids, tok(turn, return_tensors="pt").input_ids.to(model.device)], dim=1)
+    out = model.generate(input_ids=ids, past_key_values=cache, max_new_tokens=128, do_sample=False)
+    print(tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True))
+    ids = out if out[0, -1] == im_end else torch.cat([out, out.new_tensor([[im_end]])], dim=1)
+```
+
+Append each new turn to the running token stream (don't re-render the whole chat template: it rewrites earlier
+turns, and a recurrent / sliding-window cache can't be rolled back). `generate` only runs the tokens that are not in
+the cache yet. For very long one-shot prompts, prefill in chunks of e.g. 4,096 tokens with a shared cache to keep peak
+memory flat as well.
 
 ## Limitations
 
