@@ -111,8 +111,9 @@ def evaluate(model: str, out: str, skip: str = ""):
 
 
 @app.function(image=image, volumes=VOLUMES, secrets=[hf_secret], cpu=8, memory=98304, timeout=4 * 3600)
-def upload(checkpoint: str, repo: str, readme: str = "", private: bool = False):
+def upload(checkpoint: str, repo: str, readme_path: str = "", private: bool = False):
     import os
+    import shutil
 
     from huggingface_hub import HfApi
 
@@ -120,9 +121,8 @@ def upload(checkpoint: str, repo: str, readme: str = "", private: bool = False):
 
     _download_base()
     out_dir = export(checkpoint, "/ckpt/export", base="Qwen/Qwen3.5-4B")
-    if readme:
-        with open(os.path.join(out_dir, "README.md"), "w") as f:
-            f.write(readme)
+    if readme_path:
+        shutil.copy(readme_path, os.path.join(out_dir, "README.md"))
     ckpt_vol.commit()
     api = HfApi(token=os.environ["HF_TOKEN"])
     api.create_repo(repo, repo_type="model", exist_ok=True, private=private)
