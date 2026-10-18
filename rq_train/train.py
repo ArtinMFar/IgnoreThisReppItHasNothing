@@ -28,7 +28,8 @@ from recurrent_qwen.modeling_recurrent_qwen import RecurrentQwenForConditionalGe
 from rq_data.formatting import FLAG_CE, FLAG_FILLER
 from rq_train.data import assign_files, list_files, make_loader
 
-NEW_PARAM_KEYS = ("in_proj_skip", "in_proj_theta")
+GATE_KEY, THETA_KEY = "in_proj_skip", "in_proj_theta"
+DEBUG_MEM = os.environ.get("RQ_DEBUG_MEM") == "1"
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -42,6 +43,13 @@ def register_flex_attention():
     from transformers import AttentionInterface
     from transformers.masking_utils import AttentionMaskInterface
 
+    # Every padded sequence length is a separate static-shape compile. Past dynamo's recompile limit (8 by default)
+    # flex attention silently falls back to eager mode, which materialises the full score matrix (>100 GB at 16k).
+    for name in ("recompile_limit", "cache_size_limit"):
+        if hasattr(torch._dynamo.config, name):
+            setattr(torch._dynamo.config, name, 64)
+    if hasattr(torch._dynamo.config, "accumulated_recompile_limit"):
+        torch._dynamo.config.accumulated_recompile_limit = 512
     compiled = torch.compile(flex_attention, dynamic=False)
 
     def sliding_flex_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0,
@@ -127,10 +135,15 @@ class DistillStudent(nn.Module):
 # ---------------------------------------------------------------------------------------------------------------
 # Model setup
 # ---------------------------------------------------------------------------------------------------------------
+def attn_config(attn):
+    """Text layers use `attn`; the (bidirectional) vision encoder always uses SDPA."""
+    return {"": "sdpa", "text_config": attn, "vision_config": "sdpa"} if attn != "sdpa" else "sdpa"
+
+
 def build_student(base, window, attn, resume_dir):
     if resume_dir and os.path.exists(os.path.join(resume_dir, "model", "config.json")):
         student = RecurrentQwenForConditionalGeneration.from_pretrained(
-            os.path.join(resume_dir, "model"), dtype=torch.float32, attn_implementation=attn)
+            os.path.join(resume_dir, "model"), dtype=torch.float32, attn_implementation=attn_config(attn))
         return student, False
     from transformers import AutoConfig
 
@@ -143,7 +156,7 @@ def build_student(base, window, attn, resume_dir):
     keep = ("image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id", "tie_word_embeddings")
     cfg = RecurrentQwenConfig(text_config=text, vision_config=vision, **{k: base_cfg[k] for k in keep if k in base_cfg})
     student = RecurrentQwenForConditionalGeneration.from_pretrained(base, config=cfg, dtype=torch.float32,
-                                                                    attn_implementation=attn)
+                                                                    attn_implementation=attn_config(attn))
     with torch.no_grad():  # make the new-parameter initialisation explicit (near-identity start)
         for layer in student.model.language_model.layers:
             if layer.block_type == "linear_attention":
@@ -168,14 +181,16 @@ def main():
     p.add_argument("--window", type=int, default=2048)
     p.add_argument("--accum", type=int, default=8)
     p.add_argument("--max-steps", type=int, default=0)
-    p.add_argument("--lr", type=float, default=1.5e-5)
-    p.add_argument("--new-lr", type=float, default=3e-4)
-    p.add_argument("--warmup", type=int, default=30)
-    p.add_argument("--ce-weight", type=float, default=0.5)
+    p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--gate-lr", type=float, default=1e-4)
+    # The rotation angle is summed over the whole sequence, so tiny changes to theta move the phase a lot
+    p.add_argument("--theta-lr", type=float, default=2e-6)
+    p.add_argument("--warmup", type=int, default=40)
+    p.add_argument("--ce-weight", type=float, default=0.25)
     p.add_argument("--aux-weight", type=float, default=0.1)
     p.add_argument("--save-every", type=int, default=200)
     p.add_argument("--attn", default="rq_flex")
-    p.add_argument("--pad-to", type=int, default=1024)
+    p.add_argument("--pad-to", type=int, default=2048)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--workers", type=int, default=3)
     args = p.parse_args()
@@ -207,7 +222,8 @@ def main():
     pad_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
 
     teacher = Qwen3_5ForConditionalGeneration.from_pretrained(args.base, dtype=torch.bfloat16,
-                                                              attn_implementation="sdpa").to(device).eval()
+                                                              attn_implementation="sdpa")
+    teacher.to(device).eval()
     teacher.requires_grad_(False)
 
     resume_dir = os.path.join(args.out, "latest")
@@ -226,15 +242,15 @@ def main():
     n_v = aux_layers[0].linear_attn.num_v_heads
     memory_heads = list(range(1, n_v, 2))
 
-    new_params, base_params = [], []
+    groups = {"base": [], "gate": [], "theta": []}
     for name, prm in student.named_parameters():
-        if not prm.requires_grad:
-            continue
-        (new_params if any(k in name for k in NEW_PARAM_KEYS) else base_params).append(prm)
-    log(f"trainable: base={sum(p.numel() for p in base_params) / 1e9:.3f}B new={sum(p.numel() for p in new_params) / 1e6:.2f}M"
+        if prm.requires_grad:
+            groups["gate" if GATE_KEY in name else "theta" if THETA_KEY in name else "base"].append(prm)
+    log(f"trainable: base={sum(p.numel() for p in groups['base']) / 1e9:.3f}B "
+        f"gate={sum(p.numel() for p in groups['gate']) / 1e6:.2f}M theta={sum(p.numel() for p in groups['theta']) / 1e6:.2f}M"
         f" | aux layers={len(aux_layers)} memory heads/layer={len(memory_heads)} | fresh={fresh}")
-    opt = torch.optim.AdamW([{"params": base_params, "lr": args.lr, "peak": args.lr},
-                             {"params": new_params, "lr": args.new_lr, "peak": args.new_lr}],
+    peaks = {"base": args.lr, "gate": args.gate_lr, "theta": args.theta_lr}
+    opt = torch.optim.AdamW([{"params": groups[k], "lr": peaks[k], "peak": peaks[k]} for k in groups],
                             betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0, fused=True)
 
     start_step = 0
@@ -299,6 +315,9 @@ def main():
         for i, b in enumerate(batch):
             row = b["row"]
             ids = b["ids"].to(device)[None]
+            if DEBUG_MEM:
+                torch.cuda.reset_peak_memory_stats()
+                mem = {"start": torch.cuda.memory_allocated() / 1e9}
             position_ids, image_embeds = None, None
             if row["images"]:
                 images = [im.to(device, non_blocking=True) for im in row["images"]]
@@ -319,6 +338,9 @@ def main():
                     mm = {"image": BaseModelOutputWithPooling(pooler_output=(image_embeds,))}
                 th = teacher.model(input_ids=ids, position_ids=position_ids, mm_encoder_outputs=mm,
                                    use_cache=False).last_hidden_state[0]
+            if DEBUG_MEM:
+                mem["teacher_peak"] = torch.cuda.max_memory_allocated() / 1e9
+                torch.cuda.reset_peak_memory_stats()
             sync = (i == len(batch) - 1) or not distributed
             ctx = contextlib.nullcontext() if sync else model.no_sync()
             with ctx, torch.autocast("cuda", dtype=torch.bfloat16):
@@ -328,6 +350,10 @@ def main():
                     b["ce_mask"].to(device), b["filler"].to(device), b["use_aux"], attn_mask)
                 loss = kl_sum / n_kl + args.ce_weight * ce_sum / n_ce + args.aux_weight * aux_sum / n_aux
                 (loss * world).backward()
+            if DEBUG_MEM:
+                mem["student_peak"] = torch.cuda.max_memory_allocated() / 1e9
+                print(f"[mem rank{rank}] step {step + 1} T={b['T']} src={row['source']} imgs={len(row['images'])} "
+                      + " ".join(f"{k}={v:.1f}" for k, v in mem.items()), flush=True)
             src = row["source"].split("-")[0]
             for key, val in (("kl", kl_sum), ("ce", ce_sum), ("aux", aux_sum), ("kl_short", kl_short),
                              ("kl_long", kl_long), (f"kl/{src}", kl_sum)):
@@ -339,9 +365,16 @@ def main():
             agg[f"n/{src}"] = agg.get(f"n/{src}", 0.0) + float(b["kl_mask"].sum())
             tok_since += b["T"]
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+        # Clip each group on its own: the rotation-angle gradients are ~30x larger than the rest (the phase is a
+        # cumulative sum over the sequence) and would otherwise rescale the base-model gradient every step.
+        group_norms = {k: float(torch.nn.utils.clip_grad_norm_(v, 1.0)) for k, v in groups.items()}
+        grad_norm = group_norms["base"]
+        if DEBUG_MEM:
+            torch.cuda.reset_peak_memory_stats()
         opt.step()
         opt.zero_grad(set_to_none=True)
+        if DEBUG_MEM:
+            print(f"[mem rank{rank}] step {step + 1} optimizer_peak={torch.cuda.max_memory_allocated() / 1e9:.1f}", flush=True)
 
         if (step + 1) % 5 == 0 or step == start_step:
             keys = sorted(agg)
@@ -364,12 +397,13 @@ def main():
                 "kl": tot["kl"] / max(tot["n_kl"], 1), "kl_short": tot["kl_short"] / max(tot["n_short"], 1),
                 "kl_long": tot["kl_long"] / max(n_long, 1), "ce": tot["ce"] / max(tot["n_ce"], 1),
                 "aux": tot["aux"] / max(tot["n_aux"], 1), "grad_norm": float(grad_norm),
+                **{f"gn_{k}": v for k, v in group_norms.items()},
                 "tok_per_s": tok.item() / dt, "mem_gb": torch.cuda.max_memory_allocated() / 1e9,
             }
             for k in keys:
                 if k.startswith("kl/"):
                     rec[k] = tot[k] / max(tot.get("n/" + k[3:], 1.0), 1.0)
-            log(json.dumps({k: (round(v, 5) if isinstance(v, float) else v) for k, v in rec.items()}))
+            log(json.dumps({k: (float(f"{v:.5g}") if isinstance(v, float) else v) for k, v in rec.items()}))
             if is_main:
                 with open(metrics_path, "a") as f:
                     f.write(json.dumps(rec) + "\n")

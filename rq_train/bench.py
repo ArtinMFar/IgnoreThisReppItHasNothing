@@ -31,6 +31,38 @@ def logits_chunked(model, ids, chunk=2048, **kw):
     return torch.cat([model.lm_head(h[i : i + chunk]).float().cpu() for i in range(0, h.shape[0], chunk)])
 
 
+def teacher_memory(base="Qwen/Qwen3.5-4B"):
+    """Peak memory / time of a no-grad teacher forward at 16k tokens with SDPA vs. flex attention."""
+    from rq_train.train import attn_config
+
+    register_flex_attention()
+    dev = torch.device("cuda")
+    ids = torch.randint(0, 200000, (1, 16384), device=dev)
+    for impl in ("sdpa", "rq_flex"):
+        teacher = Qwen3_5ForConditionalGeneration.from_pretrained(base, dtype=torch.bfloat16,
+                                                                  attn_implementation=attn_config(impl)).to(dev).eval()
+        mask = {"full_attention": None, "linear_attention": None} if impl == "rq_flex" else None
+        outs = []
+        for _ in range(2):
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            base_mem = torch.cuda.memory_allocated()
+            t0 = time.time()
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                h = teacher.model(input_ids=ids, attention_mask=mask, use_cache=False).last_hidden_state
+            torch.cuda.synchronize()
+            outs.append(h.float())
+        print(f"teacher {impl:8s} 16k fwd {time.time() - t0:.2f}s, transient peak "
+              f"{(torch.cuda.max_memory_allocated() - base_mem) / 1e9:.1f} GB", flush=True)
+        if impl == "sdpa":
+            ref = outs[-1]
+        else:
+            print("teacher flex vs sdpa hidden max diff:", (outs[-1] - ref).abs().max().item(),
+                  "rel:", ((outs[-1] - ref).norm() / ref.norm()).item(), flush=True)
+        del teacher, h, outs
+        torch.cuda.empty_cache()
+
+
 def main(base="Qwen/Qwen3.5-4B", data="/data/rows"):
     dev = torch.device("cuda")
     print("GPU:", torch.cuda.get_device_name(0), "| torch", torch.__version__)

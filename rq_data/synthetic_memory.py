@@ -38,7 +38,7 @@ def _code(rng):
 
 
 def make_facts(rng):
-    """Returns a list of (statement, question, answer, key) tuples; keys allow later updates."""
+    """Returns (statement, question, answer, key, values) tuples; keys allow updates, values are what must be recalled."""
     n1, n2, n3 = rng.sample(FIRST, 3)
     city, job, color, food = rng.choice(CITIES), rng.choice(JOBS), rng.choice(COLORS), rng.choice(FOODS)
     item, place, loc = rng.choice(ITEMS), rng.choice(PLACES), rng.choice(LOCATIONS)
@@ -48,23 +48,23 @@ def make_facts(rng):
     count = rng.randint(3, 17)
     facts = [
         (f"By the way, my name is {n1} and I'm a {job} from {city}.", "What is my name and where am I from?",
-         f"Your name is {n1}, and you're a {job} from {city}.", "name"),
+         f"Your name is {n1}, and you're a {job} from {city}.", "name", (n1, city)),
         (f"The code for the vault is {code}, please remember it.", "What is the vault code I gave you?",
-         f"The vault code is {code}.", "code"),
+         f"The vault code is {code}.", "code", (code,)),
         (f"Just so you know, I'm allergic to {food}.", "What am I allergic to?", f"You're allergic to {food}.",
-         "food"),
-        (f"My favorite color is {color}.", "What's my favorite color?", f"Your favorite color is {color}.", "color"),
+         "food", (food,)),
+        (f"My favorite color is {color}.", "What's my favorite color?", f"Your favorite color is {color}.", "color", (color,)),
         (f"I hid the {item} under the {place} near the {loc}.", f"Where did I hide the {item}?",
-         f"You hid the {item} under the {place} near the {loc}.", "item"),
+         f"You hid the {item} under the {place} near the {loc}.", "item", (place, loc)),
         (f"The password for the guild hall is '{w1} {w2}'.", "What is the guild hall password?",
-         f"The guild hall password is '{w1} {w2}'.", "password"),
+         f"The guild hall password is '{w1} {w2}'.", "password", (f"{w1} {w2}",)),
         (f"I have a meeting with {n2} on {day} at {hour}.", f"When is my meeting with {n2}?",
-         f"Your meeting with {n2} is on {day} at {hour}.", "meeting"),
-        (f"My {rel}'s name is {n3}.", f"What is my {rel}'s name?", f"Your {rel}'s name is {n3}.", "relation"),
+         f"Your meeting with {n2} is on {day} at {hour}.", "meeting", (day, hour)),
+        (f"My {rel}'s name is {n3}.", f"What is my {rel}'s name?", f"Your {rel}'s name is {n3}.", "relation", (n3,)),
         (f"I have a {pet} named {pet_name}.", "What pet do I have and what is its name?",
-         f"You have a {pet} named {pet_name}.", "pet"),
+         f"You have a {pet} named {pet_name}.", "pet", (pet, pet_name)),
         (f"For the quest, I need to bring {count} wolf pelts to the elder in {city}.",
-         "How many wolf pelts do I need for the quest?", f"You need to bring {count} wolf pelts.", "quest"),
+         "How many wolf pelts do I need for the quest?", f"You need to bring {count} wolf pelts.", "quest", (str(count),)),
     ]
     rng.shuffle(facts)
     return facts
@@ -74,14 +74,14 @@ def make_update(rng, key):
     """A later statement that overrides an earlier fact (tests overwriting old memories)."""
     if key == "color":
         c = rng.choice(COLORS)
-        return f"Actually, I changed my mind, my favorite color is now {c}.", f"Your favorite color is now {c}."
+        return f"Actually, I changed my mind, my favorite color is now {c}.", f"Your favorite color is now {c}.", (c,)
     if key == "code":
         c = _code(rng)
-        return f"Update: the vault code was changed to {c}.", f"The vault code is now {c}."
+        return f"Update: the vault code was changed to {c}.", f"The vault code is now {c}.", (c,)
     if key == "password":
         w1, w2 = rng.sample(WORDS, 2)
         return (f"Heads up, the guild hall password changed to '{w1} {w2}'.",
-                f"The guild hall password is now '{w1} {w2}'.")
+                f"The guild hall password is now '{w1} {w2}'.", (f"{w1} {w2}",))
     return None
 
 
@@ -219,8 +219,11 @@ SMALL_TALK = [
 ]
 
 
-def generate_sample(tokenizer, rng: random.Random, target_tokens: int):
-    """Builds one synthetic memory sample of roughly `target_tokens` tokens. Returns (ids, flags)."""
+def generate_sample(tokenizer, rng: random.Random, target_tokens: int, return_values=False):
+    """Builds one synthetic memory sample of roughly `target_tokens` tokens.
+
+    Returns (ids, flags), plus the values the answer must contain when `return_values` is set.
+    """
     facts = make_facts(rng)
     n_facts = rng.randint(2, 5)
     stated = facts[:n_facts]
@@ -237,7 +240,7 @@ def generate_sample(tokenizer, rng: random.Random, target_tokens: int):
         messages.append({"role": "system", "content": sysmsg})
 
     # Facts, interleaved with a bit of natural small talk
-    for statement, _, _, _ in stated:
+    for statement, *_ in stated:
         if rng.random() < 0.3:
             q, a = rng.choice(SMALL_TALK)
             messages += [{"role": "user", "content": q}, {"role": "assistant", "content": a}]
@@ -296,19 +299,22 @@ def generate_sample(tokenizer, rng: random.Random, target_tokens: int):
 
     # Final question(s): mostly about early facts, sometimes about the latest repetitive state (still in window)
     asked = rng.sample(stated, rng.randint(1, min(2, len(stated))))
-    answers = []
+    answers, values = [], []
     for fact in asked:
         if update and fact is update[0]:
             answers.append(update[1][1])
+            values.extend(update[1][2])
         else:
             answers.append(fact[2])
+            values.extend(fact[4])
     question = " Also, ".join(f[1] if i == 0 else f[1][0].lower() + f[1][1:] for i, f in enumerate(asked))
     if last_tick is not None and rng.random() < 0.15:
         question += " And what did the most recent update say, exactly?"
         answers.append(f"The most recent update was: {last_tick}")
+        values.append(last_tick)
     prefix = "[Player]: " if npc_mode else ""
     final = [{"role": "user", "content": prefix + question},
              {"role": "assistant", "content": " ".join(answers), "flag": FLAG_CE}]
 
-    segs = chat_segments(messages + filler_msgs + final)
-    return encode_segments(tokenizer, segs)
+    ids, flags = encode_segments(tokenizer, chat_segments(messages + filler_msgs + final))
+    return (ids, flags, values) if return_values else (ids, flags)

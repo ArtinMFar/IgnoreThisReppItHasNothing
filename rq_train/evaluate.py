@@ -49,6 +49,12 @@ def prefill(model, ids, cache, chunk=4096):
 def scaling(model, lengths, device, decode_steps=32):
     from transformers import DynamicCache
 
+    # warm-up: kernel autotuning / compilation for every chunk shape used below
+    warm = DynamicCache(config=model.config.get_text_config())
+    out = prefill(model, torch.randint(1000, 100000, (1, 2 * 4096 + 1024), device=device), warm)
+    for _ in range(4):
+        out = model(input_ids=out.logits[:, -1:].argmax(-1), past_key_values=warm, use_cache=True)
+    del warm, out
     results = []
     for L in lengths:
         ids = torch.randint(1000, 100000, (1, L), device=device)
@@ -90,7 +96,7 @@ def memory_recall(model, tokenizer, device, n=60, seed=987654):
     buckets = {}
     for i in range(n):
         target = [3000, 6000, 12000, 24000][i % 4]
-        ids, flags = generate_sample(tokenizer, rng, target)
+        ids, flags, values = generate_sample(tokenizer, rng, target, return_values=True)
         text = tokenizer.decode(ids)
         prompt_text, answer = text.rsplit("<think>\n\n</think>\n\n", 1)
         answer = answer.replace("<|im_end|>", "").strip()
@@ -107,8 +113,7 @@ def memory_recall(model, tokenizer, device, n=60, seed=987654):
             if gen[-1] in (tokenizer.convert_tokens_to_ids("<|im_end|>"), tokenizer.eos_token_id):
                 break
         pred = tokenizer.decode(gen, skip_special_tokens=True)
-        keys = re.findall(r"(?:is now|is|are|named|under the|on|bring|name is|allergic to) ([^,.]+)", answer)
-        ok = all(_norm(k) in _norm(pred) for k in keys) if keys else _norm(answer) in _norm(pred)
+        ok = all(_norm(v) in _norm(pred) for v in values)
         b = buckets.setdefault(target, [0, 0])
         b[0] += int(ok)
         b[1] += 1
@@ -216,6 +221,11 @@ def main():
     tok = processor.tokenizer
     if args.model == "teacher":
         model = Qwen3_5ForConditionalGeneration.from_pretrained(args.base, dtype=torch.bfloat16)
+    elif args.model == "fresh":  # converted architecture, before any training
+        from rq_train.train import build_student
+
+        model, _ = build_student(args.base, 2048, "sdpa", None)
+        model.to(torch.bfloat16)
     else:
         model = RecurrentQwenForConditionalGeneration.from_pretrained(args.model, dtype=torch.bfloat16,
                                                                       attn_implementation="sdpa")

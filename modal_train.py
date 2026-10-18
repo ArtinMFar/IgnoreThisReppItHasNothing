@@ -21,7 +21,7 @@ image = (
     .uv_pip_install("torch==2.13.0", "torchvision==0.28.0", index_url="https://download.pytorch.org/whl/cu130")
     .uv_pip_install(
         "transformers==5.20.1", "flash-linear-attention==0.5.2", "accelerate", "safetensors", "pyarrow", "pillow",
-        "numpy", "einops",
+        "numpy", "einops", "datasets",
     )
     .env({
         "HF_HOME": "/hf", "HF_HUB_DISABLE_PROGRESS_BARS": "1", "TOKENIZERS_PARALLELISM": "false",
@@ -41,15 +41,30 @@ def _download_base():
 
 
 @app.function(image=image, volumes=VOLUMES, secrets=[hf_secret], gpu="B200", timeout=3600, cpu=8, memory=65536)
-def bench():
+def bench(teacher_only: bool = False):
     _download_base()
-    from rq_train.bench import main
+    from rq_train.bench import main, teacher_memory
+
+    teacher_memory()
+    if not teacher_only:
+        main()
+
+
+@app.function(image=image, volumes=VOLUMES, secrets=[hf_secret], gpu="B200", timeout=3600, cpu=8, memory=65536)
+def bench_shapes():
+    _download_base()
+    from rq_train.bench_shapes import main
 
     main()
 
 
 def _train(gpus: int, extra: list[str]):
+    import os
+
     _download_base()
+    if "--debug-mem" in extra:
+        extra = [e for e in extra if e != "--debug-mem"]
+        os.environ["RQ_DEBUG_MEM"] = "1"
     cmd = ["torchrun", f"--nproc_per_node={gpus}", "--standalone", "-m", "rq_train.train", *extra]
     print(" ".join(cmd), flush=True)
     proc = subprocess.run(cmd, check=False)
@@ -67,21 +82,23 @@ def train_1(extra: list[str]):
     _train(1, extra)
 
 
-@app.function(gpu="B200:4", cpu=32, memory=393216, **TRAIN_KW)
+@app.function(gpu="B200:4", cpu=32, memory=262144, **TRAIN_KW)
 def train_4(extra: list[str]):
     _train(4, extra)
 
 
-@app.function(gpu="B200:8", cpu=64, memory=786432, **TRAIN_KW)
+@app.function(gpu="B200:8", cpu=48, memory=393216, **TRAIN_KW)
 def train_8(extra: list[str]):
     _train(8, extra)
 
 
 @app.local_entrypoint()
 def train(gpus: int = 1, out: str = "/ckpt/run1", max_steps: int = 0, accum: int = 8, save_every: int = 200,
-          lr: float = 1.5e-5, attn: str = "rq_flex"):
-    extra = ["--out", out, "--max-steps", str(max_steps), "--accum", str(accum), "--save-every", str(save_every),
-             "--lr", str(lr), "--attn", attn]
+          lr: float = 1e-5, gate_lr: float = 1e-4, theta_lr: float = 2e-6, attn: str = "rq_flex",
+          warmup: int = 40, debug_mem: bool = False):
+    extra = ["--debug-mem"] * debug_mem + ["--out", out, "--max-steps", str(max_steps), "--accum", str(accum), "--save-every", str(save_every),
+             "--lr", str(lr), "--gate-lr", str(gate_lr), "--theta-lr", str(theta_lr), "--attn", attn,
+             "--warmup", str(warmup)]
     {1: train_1, 4: train_4, 8: train_8}[gpus].remote(extra)
 
 
